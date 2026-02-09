@@ -1,0 +1,476 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signOut } from 'firebase/auth';
+import { getFirestore, doc, setDoc, getDoc } from 'firebase/firestore';
+import { Coffee, User, Clock, Star, ArrowRight, Gauge, X, Settings, BookOpen, Info } from 'lucide-react';
+
+// --- Firebase Config & Initialization ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'coffee-master-sim';
+
+// --- Constants ---
+const DRINK_TYPES = {
+  ESPRESSO: { id: 'espresso', name: 'אספרסו', price: 12, complexity: 1, milk: false, color: '#2c1a11' },
+  AMERICANO: { id: 'americano', name: 'אמריקנו', price: 14, complexity: 1, milk: false, color: '#3e2723' },
+  CAPPUCCINO: { id: 'cappuccino', name: 'קפוצ\'ינו', price: 18, complexity: 2, milk: true, color: '#6d4c41' },
+  LATTE: { id: 'latte', name: 'לאטה', price: 20, complexity: 2, milk: true, color: '#8d6e63' },
+};
+
+type Station = 'COUNTER' | 'GRINDER' | 'TAMPER' | 'BREWER' | 'STEAMER' | 'LATTE_ART' | 'SERVING';
+const CUSTOMER_NAMES = ['דניאל', 'נועה', 'איתי', 'מאיה', 'יוסי', 'עדי', 'תומר', 'רוני', 'גיא', 'שיר'];
+
+// --- Enhanced SFX Logic ---
+class AudioManager {
+  private ctx: AudioContext | null = null;
+  private activeLoops: Map<string, { source: AudioBufferSourceNode, gain: GainNode }> = new Map();
+
+  private getCtx() {
+    if (!this.ctx) this.ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    return this.ctx;
+  }
+
+  playOneShot(type: 'click' | 'success' | 'money' | 'fail', volume: number) {
+    if (volume === 0) return;
+    const ctx = this.getCtx();
+    const now = ctx.currentTime;
+    const masterGain = ctx.createGain();
+    masterGain.connect(ctx.destination);
+    masterGain.gain.setValueAtTime((volume / 100) * 0.2, now);
+
+    switch(type) {
+      case 'click':
+        const osc = ctx.createOscillator();
+        osc.connect(masterGain);
+        osc.frequency.setValueAtTime(600, now);
+        osc.frequency.exponentialRampToValueAtTime(200, now + 0.05);
+        osc.start();
+        osc.stop(now + 0.05);
+        break;
+      case 'success':
+        [523, 659, 783].forEach((f, i) => {
+          const o = ctx.createOscillator();
+          const g = ctx.createGain();
+          o.connect(g).connect(masterGain);
+          o.frequency.setValueAtTime(f, now + i * 0.1);
+          g.gain.setValueAtTime(0.1, now + i * 0.1);
+          g.gain.exponentialRampToValueAtTime(0.01, now + i * 0.1 + 0.3);
+          o.start(now + i * 0.1);
+          o.stop(now + i * 0.1 + 0.3);
+        });
+        break;
+      case 'money':
+        const mOsc = ctx.createOscillator();
+        mOsc.connect(masterGain);
+        mOsc.frequency.setValueAtTime(1200, now);
+        mOsc.frequency.exponentialRampToValueAtTime(1800, now + 0.1);
+        mOsc.start();
+        mOsc.stop(now + 0.1);
+        break;
+      case 'fail':
+        const fOsc = ctx.createOscillator();
+        fOsc.type = 'sawtooth';
+        fOsc.connect(masterGain);
+        fOsc.frequency.setValueAtTime(150, now);
+        fOsc.linearRampToValueAtTime(50, now + 0.4);
+        fOsc.start();
+        fOsc.stop(now + 0.4);
+        break;
+    }
+  }
+
+  startLoop(type: 'grind' | 'steam' | 'brew' | 'draw', volume: number) {
+    if (volume === 0 || this.activeLoops.has(type)) return;
+    const ctx = this.getCtx();
+    const now = ctx.currentTime;
+    const gain = ctx.createGain();
+    gain.connect(ctx.destination);
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime((volume / 100) * 0.15, now + 0.1);
+
+    const bufferSize = ctx.sampleRate * 2;
+    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    
+    for (let i = 0; i < bufferSize; i++) {
+      if (type === 'grind') data[i] = (Math.random() * 2 - 1) * 0.5;
+      else if (type === 'steam') data[i] = (Math.random() * 2 - 1) * 0.2;
+      else data[i] = (Math.random() * 2 - 1) * 0.1;
+    }
+
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.loop = true;
+
+    const filter = ctx.createBiquadFilter();
+    if (type === 'grind') {
+      filter.type = 'lowpass';
+      filter.frequency.setValueAtTime(600, now);
+    } else {
+      filter.type = 'highpass';
+      filter.frequency.setValueAtTime(1500, now);
+    }
+
+    source.connect(filter).connect(gain);
+    source.start();
+    this.activeLoops.set(type, { source, gain });
+  }
+
+  stopLoop(type: string) {
+    const loop = this.activeLoops.get(type);
+    if (loop) {
+      const now = this.getCtx().currentTime;
+      loop.gain.gain.linearRampToValueAtTime(0, now + 0.1);
+      setTimeout(() => {
+        loop.source.stop();
+        this.activeLoops.delete(type);
+      }, 150);
+    }
+  }
+}
+
+const sfx = new AudioManager();
+
+const Button = ({ onClick, disabled, children, className = "", variant = "primary", onMouseDown, onMouseUp, onTouchStart, onTouchEnd }: any) => {
+  const variants = {
+    primary: "bg-amber-600 hover:bg-amber-500 text-white disabled:bg-stone-700 disabled:text-stone-500",
+    secondary: "bg-stone-700 hover:bg-stone-600 text-stone-100 disabled:opacity-50",
+    success: "bg-green-600 hover:bg-green-500 text-white",
+    danger: "bg-red-600 hover:bg-red-500 text-white",
+    ghost: "bg-transparent hover:bg-white/10 text-white border border-white/20"
+  };
+
+  return (
+    <button 
+      onClick={onClick} onMouseDown={onMouseDown} onMouseUp={onMouseUp} 
+      onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}
+      disabled={disabled} 
+      className={`px-4 py-3 rounded-xl font-bold transform active:scale-95 transition-all shadow-lg flex items-center justify-center gap-2 select-none ${variants[variant as keyof typeof variants]} ${className}`}
+    >
+      {children}
+    </button>
+  );
+};
+
+export default function CoffeeShopSimulator() {
+  const [user, setUser] = useState<any>(null);
+  const [gameState, setGameState] = useState<'START' | 'PLAYING' | 'SETTINGS' | 'TUTORIAL'>('START');
+  const [money, setMoney] = useState(100);
+  const [reputation, setReputation] = useState(10);
+  const [shopName, setShopName] = useState('Coffee Master');
+  const [volume, setVolume] = useState(40);
+
+  const [currentStation, setCurrentStation] = useState<Station>('COUNTER');
+  const [customer, setCustomer] = useState<any>(null);
+  const [patience, setPatience] = useState(100);
+  const [notifications, setNotifications] = useState<any[]>([]);
+  
+  const [grindLevel, setGrindLevel] = useState(0);
+  const [tampPower, setTampPower] = useState(0);
+  const [brewProgress, setBrewProgress] = useState(0);
+  const [isBrewing, setIsBrewing] = useState(false);
+  const [milkTemp, setMilkTemp] = useState(20);
+  const [milkFroth, setMilkFroth] = useState(0);
+  const [drinkQuality, setDrinkQuality] = useState({ grind: 0, tamp: 0, brew: 0, milk: 0, art: 0 });
+
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [isDrawing, setIsDrawing] = useState(false);
+  const pressTimerRef = useRef<any>(null);
+
+  // --- Game Mechanics ---
+  const addNotification = (text: string, type: 'success' | 'money' | 'warn' = 'success') => {
+    const id = Date.now();
+    setNotifications(prev => [...prev, { id, text, type }]);
+    setTimeout(() => setNotifications(prev => prev.filter(n => n.id !== id)), 2500);
+    if (type === 'money') sfx.playOneShot('money', volume);
+    else if (type === 'success') sfx.playOneShot('success', volume);
+    else if (type === 'warn') sfx.playOneShot('fail', volume);
+  };
+
+  const spawnCustomer = useCallback(() => {
+    const randomType = Object.values(DRINK_TYPES)[Math.floor(Math.random() * 4)];
+    setCustomer({ name: CUSTOMER_NAMES[Math.floor(Math.random() * 10)], order: randomType });
+    setPatience(100);
+    setGrindLevel(0); setBrewProgress(0); setMilkTemp(20); setMilkFroth(0); setIsBrewing(false);
+    setDrinkQuality({ grind: 0, tamp: 0, brew: 0, milk: 0, art: 0 });
+  }, []);
+
+  useEffect(() => {
+    if (gameState !== 'PLAYING') return;
+    if (!customer && currentStation === 'COUNTER') {
+      const t = setTimeout(spawnCustomer, 2000);
+      return () => clearTimeout(t);
+    }
+    if (customer) {
+      const i = setInterval(() => {
+        setPatience(p => {
+          if (p <= 0) {
+            setCustomer(null);
+            setReputation(r => Math.max(0, r - 5));
+            addNotification("הלקוח עזב בכעס!", "warn");
+            setCurrentStation('COUNTER');
+            return 0;
+          }
+          return p - 0.2;
+        });
+      }, 100);
+      return () => clearInterval(i);
+    }
+  }, [customer, gameState, currentStation, spawnCustomer]);
+
+  // --- Stations Logic ---
+  const startGrind = () => {
+    sfx.startLoop('grind', volume);
+    pressTimerRef.current = setInterval(() => setGrindLevel(p => Math.min(100, p + 1.5)), 60);
+  };
+  const stopGrind = () => {
+    sfx.stopLoop('grind');
+    clearInterval(pressTimerRef.current);
+    const q = grindLevel >= 80 && grindLevel <= 95 ? 100 : Math.max(0, 100 - Math.abs(87 - grindLevel) * 4);
+    setDrinkQuality(p => ({ ...p, grind: q }));
+    setCurrentStation('TAMPER');
+  };
+
+  const startSteam = () => {
+    sfx.startLoop('steam', volume);
+    pressTimerRef.current = setInterval(() => {
+      setMilkTemp(p => Math.min(95, p + 0.8));
+      setMilkFroth(p => Math.min(100, p + 1));
+    }, 60);
+  };
+  const stopSteam = () => {
+    sfx.stopLoop('steam');
+    clearInterval(pressTimerRef.current);
+    const q = milkTemp >= 62 && milkTemp <= 72 ? 100 : Math.max(0, 100 - Math.abs(67 - milkTemp) * 4);
+    setDrinkQuality(p => ({ ...p, milk: q }));
+    setCurrentStation('LATTE_ART');
+  };
+
+  useEffect(() => {
+    if (isBrewing) sfx.startLoop('brew', volume * 0.5);
+    else sfx.stopLoop('brew');
+    return () => sfx.stopLoop('brew');
+  }, [isBrewing, volume]);
+
+  // --- Rendering Latte Art ---
+  const handleArtDraw = (e: any) => {
+    if (!isDrawing || !canvasRef.current) return;
+    const ctx = canvasRef.current.getContext('2d')!;
+    const rect = canvasRef.current.getBoundingClientRect();
+    const x = (e.clientX || e.touches[0].clientX) - rect.left;
+    const y = (e.clientY || e.touches[0].clientY) - rect.top;
+
+    const grad = ctx.createRadialGradient(x, y, 2, x, y, 14);
+    grad.addColorStop(0, 'rgba(255, 255, 255, 0.7)');
+    grad.addColorStop(1, 'rgba(255, 255, 255, 0)');
+    ctx.fillStyle = grad;
+    ctx.filter = 'blur(1.5px)';
+    ctx.beginPath();
+    ctx.arc(x, y, 14, 0, Math.PI * 2);
+    ctx.fill();
+    setDrinkQuality(p => ({ ...p, art: Math.min(100, p.art + 1) }));
+  };
+
+  useEffect(() => {
+    if (currentStation === 'LATTE_ART' && canvasRef.current) {
+      const ctx = canvasRef.current.getContext('2d')!;
+      ctx.fillStyle = customer?.order?.color || '#3e2723';
+      ctx.fillRect(0,0,300,300);
+      for(let i=0; i<30; i++) {
+        ctx.fillStyle = `rgba(100, 50, 20, ${Math.random() * 0.2})`;
+        ctx.beginPath(); ctx.arc(Math.random()*300, Math.random()*300, Math.random()*30, 0, Math.PI*2); ctx.fill();
+      }
+    }
+  }, [currentStation, customer]);
+
+  const renderStation = () => {
+    switch(currentStation) {
+      case 'COUNTER':
+        return (
+          <div className="flex flex-col items-center justify-center h-full space-y-6">
+            {customer ? (
+              <div className="bg-stone-800 p-8 rounded-3xl border-2 border-stone-600 w-full max-w-sm text-center">
+                <div className="w-full h-1.5 bg-stone-700 mb-6 rounded-full overflow-hidden">
+                  <div className={`h-full transition-all duration-300 ${patience > 30 ? 'bg-green-500' : 'bg-red-500'}`} style={{width: `${patience}%`}} />
+                </div>
+                <User className="w-16 h-16 mx-auto mb-4 text-amber-500" />
+                <h2 className="text-2xl font-bold">{customer.name}</h2>
+                <p className="text-amber-400 italic mb-6">"אפשר {customer.order.name} בבקשה?"</p>
+                <Button onClick={() => { sfx.playOneShot('click', volume); setCurrentStation('GRINDER'); }} className="w-full text-lg">התחל הכנה</Button>
+              </div>
+            ) : <div className="text-stone-500 flex flex-col items-center animate-pulse"><Clock className="w-12 h-12 mb-2" /> מחכה ללקוח...</div>}
+          </div>
+        );
+      case 'GRINDER':
+        return (
+          <div className="flex flex-col items-center justify-center h-full space-y-8">
+            <h2 className="text-2xl font-bold text-amber-500">טחינת פולים</h2>
+            <div className="w-48 h-64 bg-stone-900 border-4 border-stone-700 relative overflow-hidden flex items-end">
+              <div className="w-full bg-[#4a3728]" style={{ height: `${grindLevel}%` }} />
+              <div className="absolute bottom-[80%] w-full h-4 bg-green-500/30 border-y border-green-500" />
+            </div>
+            <Button onMouseDown={startGrind} onMouseUp={stopGrind} onTouchStart={startGrind} onTouchEnd={stopGrind} className="w-48 py-6">לחץ לטחינה</Button>
+          </div>
+        );
+      case 'TAMPER':
+        return (
+          <div className="flex flex-col items-center justify-center h-full space-y-8">
+            <h2 className="text-2xl font-bold text-amber-500">דחיסה</h2>
+            <div className="w-20 h-64 bg-stone-800 rounded-full border-4 border-stone-700 relative overflow-hidden">
+               <div className="absolute bottom-0 w-full bg-amber-500 transition-all duration-75" style={{ height: `${Math.sin(Date.now()/200)*50+50}%` }} id="tamp-bar" />
+            </div>
+            <Button onClick={() => { 
+                const bar = document.getElementById('tamp-bar');
+                const h = bar ? parseFloat(bar.style.height) : 0;
+                setDrinkQuality(p => ({ ...p, tamp: h > 85 ? 100 : h }));
+                sfx.playOneShot('click', volume);
+                setCurrentStation('BREWER');
+            }} className="w-48 py-4">דחוס עכשיו!</Button>
+          </div>
+        );
+      case 'BREWER':
+        return (
+          <div className="flex flex-col items-center justify-center h-full space-y-8">
+            <h2 className="text-2xl font-bold text-amber-500">חילוץ קפה</h2>
+            <div className="relative w-64 h-64 flex items-center justify-center bg-stone-800 rounded-full border-8 border-stone-700">
+               <Gauge className="w-32 h-32 text-stone-600" />
+               <div className="absolute inset-0 flex items-center justify-center text-4xl font-mono">{Math.round(brewProgress)}ml</div>
+            </div>
+            <Button onClick={() => {
+                if(!isBrewing) { setIsBrewing(true); const i = setInterval(() => setBrewProgress(p => p + 1), 50); (window as any).brewInt = i; }
+                else { 
+                  setIsBrewing(false); clearInterval((window as any).brewInt);
+                  setDrinkQuality(p => ({ ...p, brew: brewProgress > 90 && brewProgress < 105 ? 100 : 50 }));
+                  if(customer.order.milk) setCurrentStation('STEAMER'); else setCurrentStation('SERVING');
+                }
+                sfx.playOneShot('click', volume);
+            }} className={`w-48 py-4 ${isBrewing ? 'bg-red-600' : 'bg-green-600'}`}>{isBrewing ? 'עצור' : 'התחל'}</Button>
+          </div>
+        );
+      case 'STEAMER':
+        return (
+          <div className="flex flex-col items-center justify-center h-full space-y-8">
+            <h2 className="text-2xl font-bold text-amber-500">הקצפת חלב</h2>
+            <div className="text-6xl font-mono text-white">{Math.round(milkTemp)}°</div>
+            <div className="w-48 h-12 bg-stone-800 rounded-full overflow-hidden border-2 border-stone-700">
+              <div className="h-full bg-white transition-all" style={{ width: `${milkFroth}%` }} />
+            </div>
+            <Button onMouseDown={startSteam} onMouseUp={stopSteam} onTouchStart={startSteam} onTouchEnd={stopSteam} className="w-48 py-6">לחץ להקצפה</Button>
+          </div>
+        );
+      case 'LATTE_ART':
+        return (
+          <div className="flex flex-col items-center justify-center h-full space-y-6">
+            <div className="flex justify-between w-full max-w-sm px-4">
+               <h2 className="text-xl font-bold text-amber-500">צייר אומנות</h2>
+               <Button onClick={() => { sfx.playOneShot('click', volume); setCurrentStation('SERVING'); }} variant="success">סיים</Button>
+            </div>
+            <div className="p-4 bg-stone-800 rounded-[3rem] shadow-inner">
+               <canvas ref={canvasRef} width={300} height={300} 
+                  onMouseDown={() => { setIsDrawing(true); sfx.startLoop('draw', volume); }} 
+                  onMouseMove={handleArtDraw} 
+                  onMouseUp={() => { setIsDrawing(false); sfx.stopLoop('draw'); }}
+                  onTouchStart={() => { setIsDrawing(true); sfx.startLoop('draw', volume); }}
+                  onTouchMove={handleArtDraw}
+                  onTouchEnd={() => { setIsDrawing(false); sfx.stopLoop('draw'); }}
+                  className="rounded-full cursor-crosshair touch-none" 
+               />
+            </div>
+          </div>
+        );
+      case 'SERVING':
+        return (
+          <div className="flex flex-col items-center justify-center h-full space-y-6">
+            <div className="w-48 h-48 bg-amber-900/20 rounded-full flex items-center justify-center border-4 border-amber-600 animate-bounce">
+              <Coffee className="w-24 h-24 text-amber-500" />
+            </div>
+            <h2 className="text-3xl font-bold">הקפה מוכן!</h2>
+            <Button onClick={() => {
+              const score = (drinkQuality.grind + drinkQuality.tamp + drinkQuality.brew + (customer.order.milk ? drinkQuality.milk : 100)) / (customer.order.milk ? 4 : 3);
+              const tip = Math.floor(customer.order.price * (score/100) * 0.4);
+              setMoney(m => m + customer.order.price + tip);
+              setReputation(r => Math.min(100, r + (score > 80 ? 2 : 1)));
+              addNotification(`קיבלת ₪${customer.order.price + tip}!`, "money");
+              setCustomer(null); setCurrentStation('COUNTER');
+            }} variant="success" className="w-48 py-4">הגש ללקוח</Button>
+          </div>
+        );
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-stone-950 text-stone-100 font-sans select-none overflow-hidden" dir="rtl">
+      {gameState === 'START' && (
+        <div className="fixed inset-0 z-50 bg-stone-950 flex items-center justify-center p-6">
+          <div className="text-center space-y-8 max-w-sm w-full">
+            <Coffee className="w-20 h-20 mx-auto text-amber-600" />
+            <h1 className="text-5xl font-black italic tracking-tighter">COFFEE MASTER</h1>
+            <div className="space-y-3">
+              <Button onClick={() => setGameState('PLAYING')} className="w-full py-6 text-xl">התחל משחק</Button>
+              <Button onClick={() => setGameState('TUTORIAL')} variant="ghost" className="w-full"><BookOpen className="w-5 h-5 ml-2" /> איך משחקים?</Button>
+              <Button onClick={() => setGameState('SETTINGS')} variant="ghost" className="w-full">הגדרות</Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {gameState === 'TUTORIAL' && (
+        <div className="fixed inset-0 z-50 bg-stone-900/95 backdrop-blur flex items-center justify-center p-6">
+          <div className="bg-stone-800 p-8 rounded-3xl max-w-md w-full relative">
+            <Button onClick={() => setGameState('START')} variant="ghost" className="absolute top-4 left-4 p-2"><X /></Button>
+            <h2 className="text-2xl font-bold mb-6 flex items-center gap-2"><Info className="text-amber-500" /> מדריך זריז</h2>
+            <div className="space-y-3 text-stone-300">
+              <p>• <b>טחינה:</b> לחץ עד שהמד מגיע לאזור הירוק.</p>
+              <p>• <b>דחיסה:</b> לחץ כשהמד בשיא הגובה (הכי קרוב ל-100).</p>
+              <p>• <b>חילוץ:</b> עצור כשכמות הקפה מגיעה ל-100ml.</p>
+              <p>• <b>הקצפה:</b> הגיע לטמפרטורה של 66 מעלות.</p>
+            </div>
+            <Button onClick={() => setGameState('START')} className="w-full mt-8">הבנתי!</Button>
+          </div>
+        </div>
+      )}
+
+      {gameState === 'SETTINGS' && (
+        <div className="fixed inset-0 z-50 bg-stone-900/95 flex items-center justify-center p-6">
+          <div className="bg-stone-800 p-8 rounded-3xl max-w-md w-full">
+            <h2 className="text-2xl font-bold mb-8">הגדרות</h2>
+            <div className="space-y-6">
+               <div>
+                 <label className="block text-stone-400 mb-2">שם העסק</label>
+                 <input type="text" value={shopName} onChange={e => setShopName(e.target.value)} className="w-full bg-stone-700 border-none rounded-xl p-3" />
+               </div>
+               <div>
+                 <label className="block text-stone-400 mb-2">עוצמת סאונד: {volume}%</label>
+                 <input type="range" value={volume} onChange={e => setVolume(parseInt(e.target.value))} className="w-full accent-amber-500" />
+               </div>
+               <Button onClick={() => setGameState('START')} className="w-full">שמור וחזור</Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <header className="bg-stone-900 p-4 flex justify-between items-center border-b border-stone-800">
+        <div className="flex items-center gap-3"><Coffee className="text-amber-600" /> <span className="font-bold">{shopName}</span></div>
+        <div className="flex gap-3">
+          <div className="bg-stone-800 px-3 py-1 rounded-full text-green-400 font-mono">₪{money}</div>
+          <div className="bg-stone-800 px-3 py-1 rounded-full flex items-center gap-1 text-yellow-500"><Star className="w-4 h-4 fill-current" /> {reputation}</div>
+          <button onClick={() => setGameState('SETTINGS')} className="text-stone-400"><Settings className="w-5 h-5" /></button>
+        </div>
+      </header>
+
+      <main className="h-[calc(100vh-70px)] p-6 max-w-lg mx-auto overflow-hidden">
+        {renderStation()}
+      </main>
+
+      <div className="fixed top-20 left-1/2 -translate-x-1/2 z-50 space-y-2 w-64 pointer-events-none">
+        {notifications.map(n => (
+          <div key={n.id} className={`p-3 rounded-xl text-center shadow-2xl border backdrop-blur animate-in slide-in-from-top-4 ${n.type === 'money' ? 'bg-green-900/80 border-green-500' : 'bg-stone-900/80 border-amber-600'}`}>
+            {n.text}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
